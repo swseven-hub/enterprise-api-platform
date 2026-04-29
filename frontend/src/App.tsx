@@ -1,9 +1,12 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   Boxes,
   CheckCircle2,
   Clock3,
+  Copy,
   Database,
   FileCode2,
   Gauge,
@@ -21,6 +24,7 @@ import {
   Settings2,
   ShieldCheck,
   Trash2,
+  Wand2,
   XCircle
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
@@ -71,9 +75,19 @@ type Step = {
   url: string;
   headers?: Record<string, string>;
   json?: Record<string, unknown>;
+  data?: Record<string, unknown>;
   params?: Record<string, unknown>;
   extract?: Array<{ name: string; path: string }>;
   assertions?: Array<{ source: string; path?: string; operator: string; expected?: unknown }>;
+};
+
+type CasePayload = {
+  project_id: number;
+  name: string;
+  description: string;
+  priority: string;
+  variables: Record<string, unknown>;
+  steps: Step[];
 };
 
 type TestPlan = {
@@ -149,6 +163,18 @@ const sampleSteps = [
     ]
   }
 ];
+
+const emptyStep = (): Step => ({
+  name: "新的请求步骤",
+  type: "request",
+  method: "GET",
+  url: "{{base_url}}/",
+  headers: {},
+  params: {},
+  json: {},
+  extract: [],
+  assertions: [{ source: "status_code", operator: "==", expected: 200 }]
+});
 
 function statusLabel(status?: string) {
   return {
@@ -357,21 +383,12 @@ export default function App() {
     await loadAll();
   }
 
-  async function createCase(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    await request<TestCase>("/api/cases", {
-      method: "POST",
-      body: JSON.stringify({
-        project_id: Number(form.get("project_id")),
-        name: form.get("name"),
-        description: form.get("description"),
-        priority: form.get("priority"),
-        variables: safeJson(String(form.get("variables") ?? "{}"), {}),
-        steps: safeJson(String(form.get("steps") ?? "[]"), [])
-      })
+  async function saveCase(payload: CasePayload, caseId?: number) {
+    await request<TestCase>(caseId ? `/api/cases/${caseId}` : "/api/cases", {
+      method: caseId ? "PUT" : "POST",
+      body: JSON.stringify(payload)
     });
-    showToast("用例已保存");
+    showToast(caseId ? "用例已更新" : "用例已保存");
     await loadAll();
   }
 
@@ -488,7 +505,14 @@ export default function App() {
         )}
         {view === "apis" && <ApisView projects={projects} apis={filteredApis} activeProjectId={activeProjectId} createApi={createApi} deleteApi={(id) => deleteItem("apis", id)} />}
         {view === "cases" && (
-          <CasesView projects={projects} cases={filteredCases} activeProjectId={activeProjectId} createCase={createCase} deleteCase={(id) => deleteItem("cases", id)} />
+          <CasesView
+            projects={projects}
+            apis={apis}
+            cases={filteredCases}
+            activeProjectId={activeProjectId}
+            saveCase={saveCase}
+            deleteCase={(id) => deleteItem("cases", id)}
+          />
         )}
         {view === "plans" && (
           <PlansView
@@ -744,53 +768,479 @@ function ApisView({
 
 function CasesView({
   projects,
+  apis,
   cases,
   activeProjectId,
-  createCase,
+  saveCase,
   deleteCase
 }: {
   projects: Project[];
+  apis: ApiEndpoint[];
   cases: TestCase[];
   activeProjectId?: number;
-  createCase: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  saveCase: (payload: CasePayload, caseId?: number) => Promise<void>;
   deleteCase: (id: number) => Promise<void>;
 }) {
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [projectId, setProjectId] = useState(activeProjectId ?? projects[0]?.id ?? 0);
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [priority, setPriority] = useState("P1");
+  const [variablesText, setVariablesText] = useState("{}");
+  const [steps, setSteps] = useState<Step[]>(() => normalizeSteps(sampleSteps));
+  const [selectedApiId, setSelectedApiId] = useState("");
+
+  useEffect(() => {
+    if (!editingId && activeProjectId) {
+      setProjectId(activeProjectId);
+    }
+  }, [activeProjectId, editingId]);
+
+  const projectApis = apis.filter((api) => api.project_id === projectId);
+
+  function resetEditor() {
+    setEditingId(null);
+    setProjectId(activeProjectId ?? projects[0]?.id ?? 0);
+    setName("");
+    setDescription("");
+    setPriority("P1");
+    setVariablesText("{}");
+    setSteps([emptyStep()]);
+    setSelectedApiId("");
+  }
+
+  function loadSample() {
+    setSteps(normalizeSteps(sampleSteps));
+  }
+
+  function editCase(item: TestCase) {
+    setEditingId(item.id);
+    setProjectId(item.project_id);
+    setName(item.name);
+    setDescription(item.description);
+    setPriority(item.priority);
+    setVariablesText(JSON.stringify(item.variables ?? {}, null, 2));
+    setSteps(normalizeSteps(item.steps?.length ? item.steps : [emptyStep()]));
+  }
+
+  function updateStep(index: number, nextStep: Step) {
+    setSteps((current) => current.map((step, stepIndex) => (stepIndex === index ? nextStep : step)));
+  }
+
+  function removeStep(index: number) {
+    setSteps((current) => current.filter((_, stepIndex) => stepIndex !== index));
+  }
+
+  function duplicateStep(index: number) {
+    setSteps((current) => {
+      const next = [...current];
+      next.splice(index + 1, 0, { ...current[index], name: `${current[index].name} copy` });
+      return next;
+    });
+  }
+
+  function moveStep(index: number, direction: -1 | 1) {
+    setSteps((current) => {
+      const target = index + direction;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  function addFromApiAsset() {
+    const api = projectApis.find((item) => item.id === Number(selectedApiId));
+    if (!api) return;
+    setSteps((current) => [
+      ...current,
+      {
+        ...emptyStep(),
+        name: api.name,
+        method: api.method,
+        url: `{{base_url}}${api.path}`,
+        assertions: [{ source: "status_code", operator: "==", expected: 200 }]
+      }
+    ]);
+    setSelectedApiId("");
+  }
+
+  async function submitCase(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!name.trim()) {
+      window.alert("请填写用例名称");
+      return;
+    }
+    if (!projectId) {
+      window.alert("请选择项目");
+      return;
+    }
+    const variables = parseJsonObject(variablesText, "变量定义");
+    if (!variables) return;
+    await saveCase(
+      {
+        project_id: projectId,
+        name,
+        description,
+        priority,
+        variables,
+        steps
+      },
+      editingId ?? undefined
+    );
+    if (!editingId) resetEditor();
+  }
+
   return (
-    <div className="split">
-      <section className="panel case-editor">
+    <div className="case-builder-layout">
+      <section className="panel case-editor-panel">
         <div className="section-title">
-          <h2>用例编排</h2>
+          <div>
+            <p className="eyebrow">{editingId ? `Case #${editingId}` : "Visual Builder"}</p>
+            <h2>可视化用例编排</h2>
+          </div>
+          <button className="secondary-action" onClick={resetEditor} type="button">
+            新建
+          </button>
         </div>
-        <form className="stack-form" onSubmit={createCase}>
-          <select name="project_id" defaultValue={activeProjectId}>
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-          <div className="two-cols">
-            <input name="name" placeholder="用例名称" required />
-            <select name="priority" defaultValue="P1">
+        <form className="case-builder" onSubmit={submitCase}>
+          <div className="builder-basics">
+            <select value={projectId} onChange={(event) => setProjectId(Number(event.target.value))}>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="用例名称" required />
+            <select value={priority} onChange={(event) => setPriority(event.target.value)}>
               {["P0", "P1", "P2", "P3"].map((item) => (
                 <option key={item}>{item}</option>
               ))}
             </select>
+            <textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="用例说明" rows={3} />
+            <textarea className="code-area" value={variablesText} onChange={(event) => setVariablesText(event.target.value)} placeholder="变量定义 JSON" rows={3} />
           </div>
-          <textarea name="description" placeholder="用例说明" rows={3} />
-          <textarea name="variables" rows={4} defaultValue="{}" />
-          <textarea name="steps" className="code-area" rows={18} defaultValue={JSON.stringify(sampleSteps, null, 2)} />
-          <button className="primary-action">
-            <Layers3 size={17} />
-            保存用例
-          </button>
+
+          <div className="step-toolbar">
+            <button type="button" className="secondary-action" onClick={() => setSteps((current) => [...current, emptyStep()])}>
+              <Plus size={16} />
+              添加请求步骤
+            </button>
+            <button type="button" className="secondary-action" onClick={loadSample}>
+              <Wand2 size={16} />
+              载入示例链路
+            </button>
+            <select value={selectedApiId} onChange={(event) => setSelectedApiId(event.target.value)}>
+              <option value="">从接口资产选择</option>
+              {projectApis.map((api) => (
+                <option key={api.id} value={api.id}>
+                  {api.method} {api.name}
+                </option>
+              ))}
+            </select>
+            <button type="button" className="secondary-action" onClick={addFromApiAsset} disabled={!selectedApiId}>
+              <FileCode2 size={16} />
+              生成步骤
+            </button>
+          </div>
+
+          <div className="step-list">
+            {steps.map((step, index) => (
+              <StepCard
+                key={`${index}-${step.name}`}
+                step={step}
+                index={index}
+                total={steps.length}
+                onChange={(nextStep) => updateStep(index, nextStep)}
+                onRemove={() => removeStep(index)}
+                onDuplicate={() => duplicateStep(index)}
+                onMove={(direction) => moveStep(index, direction)}
+              />
+            ))}
+          </div>
+
+          <div className="builder-footer">
+            <div>
+              <strong>{steps.length}</strong>
+              <span> 个步骤会按当前顺序执行</span>
+            </div>
+            <button className="primary-action">
+              <Layers3 size={17} />
+              {editingId ? "更新用例" : "保存用例"}
+            </button>
+          </div>
         </form>
       </section>
-      <section className="panel wide">
-        <CaseList cases={cases} onDelete={deleteCase} />
+      <section className="panel case-list-panel">
+        <div className="section-title">
+          <h2>用例资产</h2>
+        </div>
+        <CaseList cases={cases} onEdit={editCase} onDelete={deleteCase} />
       </section>
     </div>
   );
+}
+
+function StepCard({
+  step,
+  index,
+  total,
+  onChange,
+  onRemove,
+  onDuplicate,
+  onMove
+}: {
+  step: Step;
+  index: number;
+  total: number;
+  onChange: (step: Step) => void;
+  onRemove: () => void;
+  onDuplicate: () => void;
+  onMove: (direction: -1 | 1) => void;
+}) {
+  const [bodyText, setBodyText] = useState(JSON.stringify(step.json ?? {}, null, 2));
+  const [bodyError, setBodyError] = useState("");
+
+  useEffect(() => {
+    setBodyText(JSON.stringify(step.json ?? {}, null, 2));
+    setBodyError("");
+  }, [step.json]);
+
+  function patch(patchData: Partial<Step>) {
+    onChange({ ...step, ...patchData });
+  }
+
+  function commitBody() {
+    try {
+      const json = bodyText.trim() ? JSON.parse(bodyText) : {};
+      setBodyError("");
+      patch({ json });
+    } catch {
+      setBodyError("JSON 格式不正确，修正后会写入步骤");
+    }
+  }
+
+  return (
+    <article className="step-card">
+      <div className="step-card-head">
+        <span className="step-index">{index + 1}</span>
+        <input value={step.name} onChange={(event) => patch({ name: event.target.value })} placeholder="步骤名称" />
+        <div className="step-actions">
+          <button type="button" className="icon-button small" onClick={() => onMove(-1)} disabled={index === 0} title="上移">
+            <ArrowUp size={15} />
+          </button>
+          <button type="button" className="icon-button small" onClick={() => onMove(1)} disabled={index === total - 1} title="下移">
+            <ArrowDown size={15} />
+          </button>
+          <button type="button" className="icon-button small" onClick={onDuplicate} title="复制">
+            <Copy size={15} />
+          </button>
+          <button type="button" className="icon-button small danger" onClick={onRemove} title="删除">
+            <Trash2 size={15} />
+          </button>
+        </div>
+      </div>
+
+      <div className="request-line">
+        <select value={step.method} onChange={(event) => patch({ method: event.target.value })}>
+          {["GET", "POST", "PUT", "PATCH", "DELETE"].map((method) => (
+            <option key={method}>{method}</option>
+          ))}
+        </select>
+        <input value={step.url} onChange={(event) => patch({ url: event.target.value })} placeholder="{{base_url}}/api/path" />
+      </div>
+
+      <div className="step-sections">
+        <details open>
+          <summary>Headers</summary>
+          <KeyValueEditor value={step.headers ?? {}} onChange={(headers) => patch({ headers: headers as Record<string, string> })} keyPlaceholder="Header" valuePlaceholder="Value" />
+        </details>
+        <details>
+          <summary>Params</summary>
+          <KeyValueEditor value={step.params ?? {}} onChange={(params) => patch({ params })} keyPlaceholder="Param" valuePlaceholder="Value" />
+        </details>
+        <details open={step.method !== "GET"}>
+          <summary>JSON Body</summary>
+          <textarea className="code-area" value={bodyText} onChange={(event) => setBodyText(event.target.value)} onBlur={commitBody} rows={6} />
+          {bodyError && <div className="field-error">{bodyError}</div>}
+        </details>
+        <details>
+          <summary>变量提取</summary>
+          <ExtractEditor value={step.extract ?? []} onChange={(extract) => patch({ extract })} />
+        </details>
+        <details open>
+          <summary>断言</summary>
+          <AssertionEditor value={step.assertions ?? []} onChange={(assertions) => patch({ assertions })} />
+        </details>
+      </div>
+    </article>
+  );
+}
+
+function KeyValueEditor({
+  value,
+  onChange,
+  keyPlaceholder,
+  valuePlaceholder
+}: {
+  value: Record<string, unknown>;
+  onChange: (value: Record<string, unknown>) => void;
+  keyPlaceholder: string;
+  valuePlaceholder: string;
+}) {
+  const entries = Object.entries(value ?? {});
+
+  function updateEntry(index: number, key: string, rawValue: string) {
+    const next = entries.map(([currentKey, currentValue], currentIndex) =>
+      currentIndex === index ? [key, parseLiteral(rawValue)] : [currentKey, currentValue]
+    );
+    onChange(Object.fromEntries(next.filter(([entryKey]) => String(entryKey).trim())));
+  }
+
+  return (
+    <div className="kv-editor">
+      {entries.map(([key, itemValue], index) => (
+        <div className="kv-row" key={`${key}-${index}`}>
+          <input value={key} onChange={(event) => updateEntry(index, event.target.value, stringifyInput(itemValue))} placeholder={keyPlaceholder} />
+          <input value={stringifyInput(itemValue)} onChange={(event) => updateEntry(index, key, event.target.value)} placeholder={valuePlaceholder} />
+          <button type="button" className="danger-link" onClick={() => onChange(Object.fromEntries(entries.filter((_, entryIndex) => entryIndex !== index)))}>
+            <Trash2 size={15} />
+          </button>
+        </div>
+      ))}
+      <button type="button" className="secondary-action" onClick={() => onChange({ ...value, "": "" })}>
+        <Plus size={15} />
+        添加字段
+      </button>
+    </div>
+  );
+}
+
+function ExtractEditor({
+  value,
+  onChange
+}: {
+  value: Array<{ name: string; path: string }>;
+  onChange: (value: Array<{ name: string; path: string }>) => void;
+}) {
+  return (
+    <div className="kv-editor">
+      {value.map((item, index) => (
+        <div className="extract-row" key={`${item.name}-${index}`}>
+          <input value={item.name} onChange={(event) => onChange(updateArray(value, index, { ...item, name: event.target.value }))} placeholder="变量名，如 token" />
+          <input value={item.path} onChange={(event) => onChange(updateArray(value, index, { ...item, path: event.target.value }))} placeholder="JSON 路径，如 data.token" />
+          <button type="button" className="danger-link" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}>
+            <Trash2 size={15} />
+          </button>
+        </div>
+      ))}
+      <button type="button" className="secondary-action" onClick={() => onChange([...value, { name: "", path: "" }])}>
+        <Plus size={15} />
+        添加提取
+      </button>
+    </div>
+  );
+}
+
+function AssertionEditor({
+  value,
+  onChange
+}: {
+  value: Array<{ source: string; path?: string; operator: string; expected?: unknown }>;
+  onChange: (value: Array<{ source: string; path?: string; operator: string; expected?: unknown }>) => void;
+}) {
+  return (
+    <div className="assertion-editor">
+      {value.map((item, index) => (
+        <div className="assertion-row" key={`${item.source}-${index}`}>
+          <select value={item.source} onChange={(event) => onChange(updateArray(value, index, { ...item, source: event.target.value }))}>
+            <option value="status_code">状态码</option>
+            <option value="json">JSON</option>
+            <option value="body">响应正文</option>
+            <option value="header">响应头</option>
+          </select>
+          <input value={item.path ?? ""} onChange={(event) => onChange(updateArray(value, index, { ...item, path: event.target.value }))} placeholder="路径，可选" />
+          <select value={item.operator} onChange={(event) => onChange(updateArray(value, index, { ...item, operator: event.target.value }))}>
+            {["==", "!=", ">", ">=", "<", "<=", "contains", "exists"].map((operator) => (
+              <option key={operator}>{operator}</option>
+            ))}
+          </select>
+          <input
+            value={stringifyInput(item.expected)}
+            onChange={(event) => onChange(updateArray(value, index, { ...item, expected: parseLiteral(event.target.value) }))}
+            placeholder="期望值"
+          />
+          <button type="button" className="danger-link" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}>
+            <Trash2 size={15} />
+          </button>
+        </div>
+      ))}
+      <button type="button" className="secondary-action" onClick={() => onChange([...value, { source: "status_code", operator: "==", expected: 200 }])}>
+        <Plus size={15} />
+        添加断言
+      </button>
+    </div>
+  );
+}
+
+function normalizeSteps(rawSteps: unknown): Step[] {
+  const items = Array.isArray(rawSteps) ? rawSteps : [];
+  return items.map((item) => {
+    const step = item as Partial<Step>;
+    return {
+      ...emptyStep(),
+      ...step,
+      type: step.type ?? "request",
+      method: step.method ?? "GET",
+      headers: step.headers ?? {},
+      params: step.params ?? {},
+      json: step.json ?? {},
+      extract: step.extract ?? [],
+      assertions: step.assertions ?? []
+    };
+  });
+}
+
+function parseJsonObject(text: string, label: string): Record<string, unknown> | null {
+  try {
+    const data = JSON.parse(text || "{}");
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      return data as Record<string, unknown>;
+    }
+    window.alert(`${label} 必须是 JSON 对象`);
+    return null;
+  } catch {
+    window.alert(`${label} JSON 格式不正确`);
+    return null;
+  }
+}
+
+function parseLiteral(raw: string): unknown {
+  const value = raw.trim();
+  if (!value) return "";
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+  if (!Number.isNaN(Number(value)) && /^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+  if ((value.startsWith("{") && value.endsWith("}")) || (value.startsWith("[") && value.endsWith("]"))) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
+}
+
+function stringifyInput(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function updateArray<T>(value: T[], index: number, nextItem: T): T[] {
+  return value.map((item, itemIndex) => (itemIndex === index ? nextItem : item));
 }
 
 function PlansView({
@@ -975,7 +1425,7 @@ function EmptyReport() {
   );
 }
 
-function CaseList({ cases, onDelete }: { cases: TestCase[]; onDelete: (id: number) => Promise<void> }) {
+function CaseList({ cases, onEdit, onDelete }: { cases: TestCase[]; onEdit: (item: TestCase) => void; onDelete: (id: number) => Promise<void> }) {
   return (
     <div className="asset-list">
       {cases.map((item) => (
@@ -986,6 +1436,9 @@ function CaseList({ cases, onDelete }: { cases: TestCase[]; onDelete: (id: numbe
             <span>{item.description}</span>
           </div>
           <span className="pill">{item.steps.length} steps</span>
+          <button className="secondary-action compact" onClick={() => onEdit(item)}>
+            编辑
+          </button>
           <button className="danger-link" onClick={() => onDelete(item.id)}>
             <Trash2 size={15} />
             删除
@@ -1079,4 +1532,3 @@ function matchText(item: Record<string, unknown>, keyword: string) {
   if (!keyword.trim()) return true;
   return JSON.stringify(item).toLowerCase().includes(keyword.toLowerCase());
 }
-
